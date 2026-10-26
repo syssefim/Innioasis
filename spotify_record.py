@@ -8,13 +8,16 @@ How it works:
   1. Track title, artist, length and cover art are read from Spotify's public embed page.
   2. A virtual sink ("SpotifySink") is created so only the browser's audio gets recorded,
      not notifications or other apps. A loopback lets you still hear it (--mute to disable).
-  3. Firefox is started with its own profile (./firefox_profile) and its audio is routed
-     into the virtual sink. Log in to Spotify once there; the login is kept.
-  4. You press play. Recording starts automatically when sound is detected and stops once
-     the track's length has been captured.
+  3. Firefox is started through Selenium with its own profile (./firefox_profile) and its
+     audio is routed into the virtual sink. Log in to Spotify once there; the login is kept.
+  4. The track page is opened. Spotify usually starts the track by itself; if it doesn't,
+     its play button is clicked (if that fails too, e.g. because you still need to log in,
+     press play yourself). Recording starts when sound is detected and stops once the
+     track's length has been captured.
   5. The audio is encoded to MP3 with ID3 tags and cover art.
 
-Requirements: firefox, ffmpeg (with libmp3lame), pactl and parec (pipewire-pulse / libpulse).
+Requirements: firefox, ffmpeg (with libmp3lame), pactl and parec (pipewire-pulse / libpulse),
+and the selenium Python package (it fetches geckodriver itself if it isn't installed).
 """
 
 import argparse
@@ -31,14 +34,27 @@ import time
 import urllib.request
 from pathlib import Path
 
+try:
+    from selenium import webdriver
+    from selenium.common.exceptions import (ElementClickInterceptedException, TimeoutException,
+                                            WebDriverException)
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support import expected_conditions as EC
+    from selenium.webdriver.support.ui import WebDriverWait
+except ImportError:
+    sys.exit("Selenium is missing: pip install selenium")
+
 SINK_NAME = "SpotifySink"
 RATE = 44100
 CHANNELS = 2
 BYTES_PER_SECOND = RATE * CHANNELS * 2  # s16le
 CHUNK_BYTES = BYTES_PER_SECOND // 10  # 100 ms
 SILENCE_PEAK = 40  # out of 32767; anything above counts as sound
+AUTOPLAY_GRACE = 8  # seconds to let Spotify start the track by itself before clicking play
 USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0"
 PROFILE_DIR = Path(__file__).resolve().parent / "firefox_profile"
+# The big green play button on a track page (the action bar, not the player bar at the bottom).
+PLAY_BUTTON = '[data-testid="action-bar-row"] [data-testid="play-button"]'
 
 
 def fetch_track_info(url):
@@ -113,41 +129,64 @@ def process_tree(root_pid):
 
 
 def route_browser_audio(browser_pid):
-    """Move any audio stream from our Firefox into the virtual sink (in case PULSE_SINK was ignored)."""
+    """Move any audio stream from our Firefox into the virtual sink (in case PULSE_SINK was ignored).
+    Returns True if one of those streams is playing."""
     pids = process_tree(browser_pid)
+    playing = False
     for stream in json.loads(pactl("-f", "json", "list", "sink-inputs") or "[]"):
         pid = stream.get("properties", {}).get("application.process.id")
         if pid and int(pid) in pids:
             subprocess.run(["pactl", "move-sink-input", str(stream["index"]), SINK_NAME],
                            capture_output=True)
+            playing = playing or not stream.get("corked")
+    return playing
 
 
-def start_browser(url):
+def start_browser():
+    """Start Firefox under Selenium. Returns the driver and Firefox's PID."""
     PROFILE_DIR.mkdir(exist_ok=True)
-    user_js = PROFILE_DIR / "user.js"
-    if not user_js.exists():
-        user_js.write_text(
-            'user_pref("media.eme.enabled", true);\n'  # DRM, needed by Spotify
-            'user_pref("media.gmp-widevinecdm.enabled", true);\n'
-            'user_pref("media.gmp-widevinecdm.visible", true);\n'
-            'user_pref("media.autoplay.default", 0);\n'
-            'user_pref("browser.shell.checkDefaultBrowser", false);\n'
-        )
-    env = dict(os.environ, PULSE_SINK=SINK_NAME)
-    return subprocess.Popen(
-        ["firefox", "--new-instance", "--profile", str(PROFILE_DIR), url],
-        env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
+    options = webdriver.FirefoxOptions()
+    # Use the profile in place; by default geckodriver would run on a temporary copy of it
+    # and the Spotify login would be lost.
+    options.add_argument("-profile")
+    options.add_argument(str(PROFILE_DIR))
+    options.set_preference("media.eme.enabled", True)  # DRM, needed by Spotify
+    options.set_preference("media.gmp-widevinecdm.enabled", True)
+    options.set_preference("media.gmp-widevinecdm.visible", True)
+    options.set_preference("media.gmp-manager.updateEnabled", True)  # geckodriver turns it off
+    options.set_preference("media.autoplay.default", 0)
+    options.set_preference("browser.shell.checkDefaultBrowser", False)
+    service = webdriver.FirefoxService(env=dict(os.environ, PULSE_SINK=SINK_NAME))
+    driver = webdriver.Firefox(options=options, service=service)
+    return driver, driver.capabilities["moz:processID"]
 
 
-def open_in_browser(url):
-    # Hands the URL to the already running Firefox that uses this profile.
-    subprocess.run(["firefox", "--profile", str(PROFILE_DIR), url],
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+def open_track(driver, url):
+    """Load the track page and wait for its play button. Returns False if it never shows up."""
+    driver.get(url)
+    try:
+        WebDriverWait(driver, 30).until(EC.element_to_be_clickable((By.CSS_SELECTOR, PLAY_BUTTON)))
+        return True
+    except TimeoutException:
+        return False
 
 
-def pause_browser(browser_pid):
-    subprocess.run(["playerctl", "-p", f"firefox.instance_{browser_pid}", "pause"], capture_output=True)
+def press_play(driver):
+    """Click the track's play button. Returns False if that didn't work."""
+    try:
+        button = driver.find_element(By.CSS_SELECTOR, PLAY_BUTTON)
+        try:
+            button.click()
+        except ElementClickInterceptedException:  # something (e.g. a cookie banner) is on top
+            driver.execute_script("arguments[0].click()", button)
+        return True
+    except WebDriverException:
+        return False
+
+
+def stop_playback(driver):
+    # Leaving the page stops the audio; the next track loads its own page anyway.
+    driver.get("about:blank")
 
 
 def peak(chunk):
@@ -155,8 +194,9 @@ def peak(chunk):
     return max(map(abs, samples), default=0)
 
 
-def record(info, browser_pid, raw_path, wait_timeout):
-    """Wait for sound on the virtual sink, then capture the track's length of audio."""
+def record(info, browser_pid, raw_path, wait_timeout, start_playback):
+    """Wait for sound on the virtual sink, then capture the track's length of audio.
+    start_playback() is called if Spotify doesn't start the track by itself."""
     parec = subprocess.Popen(
         ["parec", "-d", f"{SINK_NAME}.monitor", "--format=s16le", f"--rate={RATE}",
          f"--channels={CHANNELS}", "--latency-msec=100"],
@@ -165,9 +205,11 @@ def record(info, browser_pid, raw_path, wait_timeout):
     target_bytes = int(info["duration"] * BYTES_PER_SECOND) // 4 * 4
     written = 0
     try:
-        print(f"Press play in the Firefox window. Waiting for audio (timeout {wait_timeout}s)...")
-        deadline = time.monotonic() + wait_timeout
+        print(f"Waiting for audio (timeout {wait_timeout}s)...")
+        started = time.monotonic()
+        deadline = started + wait_timeout
         last_route = 0
+        clicked = False
         while True:
             chunk = parec.stdout.read(CHUNK_BYTES)
             if not chunk:
@@ -175,8 +217,16 @@ def record(info, browser_pid, raw_path, wait_timeout):
             if peak(chunk) > SILENCE_PEAK:
                 break
             if time.monotonic() - last_route > 1:
-                route_browser_audio(browser_pid)
+                playing = route_browser_audio(browser_pid)
                 last_route = time.monotonic()
+                # Spotify usually autoplays the track; clicking play then would pause it again.
+                if not clicked and not playing and last_route - started > AUTOPLAY_GRACE:
+                    clicked = True
+                    if start_playback():
+                        print("Spotify didn't start the track by itself, pressed play.")
+                    else:
+                        print("Could not press play automatically (not logged in?). "
+                              "Press play in the Firefox window.")
             if time.monotonic() > deadline:
                 raise TimeoutError("No audio detected. Did playback start?")
 
@@ -251,32 +301,37 @@ def main():
     tracks = [fetch_track_info(link) for link in args.links]
 
     modules = setup_audio(listen=not args.mute)
-    browser = None
+    driver = None
     # Make Ctrl+C still run the cleanup below.
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))
     try:
         with tempfile.TemporaryDirectory() as tmp:
             for n, info in enumerate(tracks, 1):
                 print(f"\n[{n}/{len(tracks)}] {info['artist']} - {info['title']} ({fmt_time(info['duration'])})")
-                if browser is None:
-                    browser = start_browser(info["url"])
-                else:
-                    open_in_browser(info["url"])
+                if driver is None:
+                    driver, browser_pid = start_browser()
+                found = open_track(driver, info["url"])
 
                 raw_path = Path(tmp) / f"{info['id']}.raw"
-                record(info, browser.pid, raw_path, args.wait)
-                pause_browser(browser.pid)
+                record(info, browser_pid, raw_path, args.wait,
+                       start_playback=lambda: found and press_play(driver))
+                stop_playback(driver)
 
                 out_path = out_dir / f"{safe_filename(info['artist'] + ' - ' + info['title'])}.mp3"
                 encode_mp3(info, raw_path, out_path, args.bitrate)
                 print(f"Saved {out_path}")
     except (TimeoutError, RuntimeError) as e:
         sys.exit(str(e))
+    except WebDriverException as e:
+        sys.exit(f"Lost control of Firefox (was the window closed?): {e.msg}")
     except KeyboardInterrupt:
         sys.exit("\nCancelled.")
     finally:
-        if browser and browser.poll() is None:
-            browser.terminate()
+        if driver:
+            try:
+                driver.quit()
+            except WebDriverException:
+                pass
         for module in reversed(modules):
             subprocess.run(["pactl", "unload-module", module], capture_output=True)
 
