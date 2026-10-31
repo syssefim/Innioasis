@@ -18,6 +18,8 @@ How it works:
 
 Requirements: firefox, ffmpeg (with libmp3lame), pactl and parec (pipewire-pulse / libpulse),
 and the selenium Python package (it fetches geckodriver itself if it isn't installed).
+
+To record a whole playlist, see spotify_playlist_record.py.
 """
 
 import argparse
@@ -32,6 +34,7 @@ import sys
 import tempfile
 import time
 import urllib.request
+from contextlib import contextmanager
 from pathlib import Path
 
 try:
@@ -57,21 +60,25 @@ PROFILE_DIR = Path(__file__).resolve().parent / "firefox_profile"
 PLAY_BUTTON = '[data-testid="action-bar-row"] [data-testid="play-button"]'
 
 
-def fetch_track_info(url):
-    match = re.search(r"track[/:]([A-Za-z0-9]{22})", url)
-    if not match:
-        sys.exit(f"Not a Spotify track link: {url}")
-    track_id = match.group(1)
-
+def fetch_embed_entity(kind, item_id):
+    """The data behind Spotify's public embed page for a track, playlist, etc."""
     request = urllib.request.Request(
-        f"https://open.spotify.com/embed/track/{track_id}",
+        f"https://open.spotify.com/embed/{kind}/{item_id}",
         headers={"User-Agent": USER_AGENT},
     )
     html = urllib.request.urlopen(request, timeout=20).read().decode("utf-8")
     data = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', html, re.S)
     if not data:
-        sys.exit("Could not read track info from Spotify (page layout may have changed).")
-    entity = json.loads(data.group(1))["props"]["pageProps"]["state"]["data"]["entity"]
+        sys.exit(f"Could not read {kind} info from Spotify (page layout may have changed).")
+    return json.loads(data.group(1))["props"]["pageProps"]["state"]["data"]["entity"]
+
+
+def fetch_track_info(url):
+    match = re.search(r"track[/:]([A-Za-z0-9]{22})", url)
+    if not match:
+        sys.exit(f"Not a Spotify track link: {url}")
+    track_id = match.group(1)
+    entity = fetch_embed_entity("track", track_id)
 
     images = entity.get("visualIdentity", {}).get("image", [])
     cover = max(images, key=lambda i: i.get("maxWidth", 0))["url"] if images else None
@@ -270,9 +277,13 @@ def encode_mp3(info, raw_path, out_path, bitrate):
         "-metadata", f"title={info['title']}",
         "-metadata", f"artist={info['artist']}",
         "-metadata", f"date={info['year']}",
-        str(out_path),
     ]
-    subprocess.run(cmd, check=True)
+    for key in ("album", "track"):  # set when recording a playlist
+        if info.get(key):
+            cmd += ["-metadata", f"{key}={info[key]}"]
+    subprocess.run(cmd + [str(out_path)], check=True)
+    if cover_path:
+        cover_path.unlink(missing_ok=True)
 
 
 def fmt_time(seconds):
@@ -283,43 +294,45 @@ def safe_filename(name):
     return re.sub(r'[\\/:*?"<>|]', "_", name).strip() or "track"
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Record Spotify tracks to MP3 via system audio capture.")
-    parser.add_argument("links", nargs="+", help="Spotify track link(s)")
-    parser.add_argument("-o", "--output-dir", default="songs", help="where to save MP3s (default: ./songs)")
-    parser.add_argument("-b", "--bitrate", default="320k", help="MP3 bitrate (default: 320k)")
-    parser.add_argument("--mute", action="store_true", help="don't play the audio through your speakers")
-    parser.add_argument("--wait", type=int, default=300, help="seconds to wait for you to press play")
-    args = parser.parse_args()
+def track_filename(info):
+    return f"{safe_filename(info['artist'] + ' - ' + info['title'])}.mp3"
 
-    for tool in ("firefox", "ffmpeg", "pactl", "parec"):
-        if not shutil.which(tool):
-            sys.exit(f"Missing required program: {tool}")
 
-    out_dir = Path(args.output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    tracks = [fetch_track_info(link) for link in args.links]
+class Session:
+    """Firefox playing into the virtual sink. Created by recording_session()."""
 
-    modules = setup_audio(listen=not args.mute)
+    def __init__(self, driver, browser_pid, tmp_dir):
+        self.driver = driver
+        self.browser_pid = browser_pid
+        self.tmp_dir = tmp_dir
+
+    def record_track(self, info, out_path, bitrate, wait):
+        found = open_track(self.driver, info["url"])
+        raw_path = self.tmp_dir / f"{info['id']}.raw"
+        try:
+            record(info, self.browser_pid, raw_path, wait,
+                   start_playback=lambda: found and press_play(self.driver))
+        except TimeoutError:
+            stop_playback(self.driver)  # in case the track starts after all
+            raise
+        stop_playback(self.driver)
+        encode_mp3(info, raw_path, out_path, bitrate)
+        raw_path.unlink()  # ~10 MB per minute, adds up over a playlist
+        print(f"Saved {out_path}")
+
+
+@contextmanager
+def recording_session(mute):
+    """Set up the virtual sink and Firefox, and remove them again afterwards.
+    Errors that end the run are turned into a short message."""
+    modules = setup_audio(listen=not mute)
     driver = None
     # Make Ctrl+C still run the cleanup below.
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))
     try:
         with tempfile.TemporaryDirectory() as tmp:
-            for n, info in enumerate(tracks, 1):
-                print(f"\n[{n}/{len(tracks)}] {info['artist']} - {info['title']} ({fmt_time(info['duration'])})")
-                if driver is None:
-                    driver, browser_pid = start_browser()
-                found = open_track(driver, info["url"])
-
-                raw_path = Path(tmp) / f"{info['id']}.raw"
-                record(info, browser_pid, raw_path, args.wait,
-                       start_playback=lambda: found and press_play(driver))
-                stop_playback(driver)
-
-                out_path = out_dir / f"{safe_filename(info['artist'] + ' - ' + info['title'])}.mp3"
-                encode_mp3(info, raw_path, out_path, args.bitrate)
-                print(f"Saved {out_path}")
+            driver, browser_pid = start_browser()
+            yield Session(driver, browser_pid, Path(tmp))
     except (TimeoutError, RuntimeError) as e:
         sys.exit(str(e))
     except WebDriverException as e:
@@ -334,6 +347,36 @@ def main():
                 pass
         for module in reversed(modules):
             subprocess.run(["pactl", "unload-module", module], capture_output=True)
+
+
+def add_common_arguments(parser):
+    parser.add_argument("-o", "--output-dir", default="songs", help="where to save MP3s (default: ./songs)")
+    parser.add_argument("-b", "--bitrate", default="320k", help="MP3 bitrate (default: 320k)")
+    parser.add_argument("--mute", action="store_true", help="don't play the audio through your speakers")
+    parser.add_argument("--wait", type=int, default=300, help="seconds to wait for you to press play")
+
+
+def check_requirements():
+    for tool in ("firefox", "ffmpeg", "pactl", "parec"):
+        if not shutil.which(tool):
+            sys.exit(f"Missing required program: {tool}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Record Spotify tracks to MP3 via system audio capture.")
+    parser.add_argument("links", nargs="+", help="Spotify track link(s)")
+    add_common_arguments(parser)
+    args = parser.parse_args()
+    check_requirements()
+
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    tracks = [fetch_track_info(link) for link in args.links]
+
+    with recording_session(args.mute) as session:
+        for n, info in enumerate(tracks, 1):
+            print(f"\n[{n}/{len(tracks)}] {info['artist']} - {info['title']} ({fmt_time(info['duration'])})")
+            session.record_track(info, out_dir / track_filename(info), args.bitrate, args.wait)
 
 
 if __name__ == "__main__":
